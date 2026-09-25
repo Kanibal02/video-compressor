@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, QMimeData, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPalette,
                            QIcon, QPixmap, QPolygon)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
@@ -1512,13 +1513,63 @@ QToolTip {{ background: #22232c; color: #e6e6ee; border: 1px solid #454859; padd
 """
 
 
+SERVER_NAME = "kanibals-video-compressor"
+
+
+def _send_to_running(paths: list[str]) -> bool:
+    """If the app is already open, hand it the files and return True."""
+    sock = QLocalSocket()
+    sock.connectToServer(SERVER_NAME)
+    if not sock.waitForConnected(300):
+        return False
+    sock.write(json.dumps(paths).encode("utf-8"))
+    sock.flush()
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
+def _listen_for_files(win: "MainWindow") -> QLocalServer:
+    server = QLocalServer(win)
+    QLocalServer.removeServer(SERVER_NAME)  # clear a stale socket left by a crash
+    server.listen(SERVER_NAME)
+
+    def on_conn():
+        conn = server.nextPendingConnection()
+        buf = bytearray()
+
+        def read():
+            buf.extend(bytes(conn.readAll()))
+
+        def done():
+            read()
+            try:
+                paths = json.loads(buf.decode("utf-8") or "[]")
+            except ValueError:
+                paths = []
+            if paths:
+                win.add_paths(paths)
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+            conn.deleteLater()
+        conn.readyRead.connect(read)
+        conn.disconnected.connect(done)
+    server.newConnection.connect(on_conn)
+    return server
+
+
 def main(argv: list[str] | None = None):
+    argv = sys.argv if argv is None else argv
+    files = [os.path.abspath(a) for a in argv[1:] if os.path.exists(a)]
     if os.name == "nt":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("kanibals.videocompressor")
         except Exception:  # noqa: BLE001
             pass
-    app = QApplication(sys.argv if argv is None else argv)
+    app = QApplication(argv)
+    if _send_to_running(files):  # e.g. "Send to" while the app is already open
+        return
     app.setStyle("Fusion")
     pal = app.palette()
     pal.setColor(QPalette.Window, QColor("#16171d"))
@@ -1530,7 +1581,7 @@ def main(argv: list[str] | None = None):
     win = MainWindow()
     dark_title_bar(win)
     win.show()
-    files = [a for a in (sys.argv[1:] if argv is None else argv[1:]) if os.path.exists(a)]
+    win._server = _listen_for_files(win)
     if files:
         win.add_paths(files)
     sys.exit(app.exec())

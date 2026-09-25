@@ -40,7 +40,10 @@ any of them yourself.
 git clone https://github.com/Kanibal02/video-compressor.git
 cd video-compressor
 pip install -r requirements.txt
+python install_sendto.py      # optional: adds "Video Compressor" to right-click > Send to
 ```
+
+`install_sendto.py --start-menu` also adds a Start menu entry; `--remove` removes both.
 
 ## Usage
 
@@ -51,6 +54,9 @@ Double-click `Video Compressor.pyw` (or run `python "Video Compressor.pyw"`):
 1. Drag videos or folders onto the window.
 2. Pick a target size, codec, and optionally ⚡ Turbo.
 3. Click **Compress**.
+
+Or select videos in Explorer → right-click → **Send to → Video Compressor**. If the app is already
+open, the files are added to its queue.
 
 The **Output plan** column previews what each file will become before you start; hover it for details.
 Settings are saved to `settings.json` next to the app.
@@ -117,4 +123,5 @@ vidcomp/engine.py       probing, analysis, planning, ffmpeg command building, en
 vidcomp/gui.py          PySide6 desktop app
 compress.py             command-line interface
 Video Compressor.pyw    double-click launcher for the GUI
+install_sendto.py       adds the Send to / Start menu shortcuts
 ```
