@@ -85,7 +85,7 @@ class EncoderSpec:
 
 ENCODERS: list[EncoderSpec] = [
     EncoderSpec("h264_nvenc", "H.264 - NVIDIA NVENC  (plays everywhere)", "h264", "nvenc", 1.35, False),
-    EncoderSpec("hevc_nvenc", "HEVC / H.265 - NVIDIA NVENC", "hevc", "nvenc", 1.00, True),
+    EncoderSpec("hevc_nvenc", "H.265 / HEVC - NVIDIA NVENC  (recommended)", "hevc", "nvenc", 1.00, True),
     EncoderSpec("av1_nvenc", "AV1 - NVIDIA NVENC  (best quality per MB)", "av1", "nvenc", 0.82, True),
     EncoderSpec("h264_qsv", "H.264 - Intel QuickSync", "h264", "qsv", 1.40, False),
     EncoderSpec("hevc_qsv", "HEVC - Intel QuickSync", "hevc", "qsv", 1.05, True),
@@ -372,14 +372,14 @@ class Settings:
     smart_probe: bool = True
 
     # video encoder
-    encoder: str = "h264_nvenc"
+    encoder: str = "hevc_nvenc"
     speed: int = 4                     # 1 fastest ... 7 best quality (NVENC p4: p5+ is slower, no better)
     rate_control: str = "vbr"          # vbr | cbr
-    multipass: str = "qres"            # disabled | qres | fullres  (NVENC)
+    multipass: str = "disabled"        # disabled | qres | fullres  (NVENC; measured: no VMAF gain, ~3% slower)
     ten_bit: bool = False
     spatial_aq: bool = True
     temporal_aq: bool = True
-    lookahead: int = 20
+    lookahead: int = 0                 # measured: no VMAF gain, ~8% slower
     decoder: str = "auto"              # auto | cpu | gpu
     tonemap_hdr: bool = True
     scaler: str = "lanczos"            # lanczos | bicubic | bilinear
@@ -401,6 +401,7 @@ class Settings:
     # performance
     parallel_jobs: int = 2
     low_priority: bool = True
+    turbo: bool = False                # trade a little quality for ~1.5-1.7x speed (see apply_turbo)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Settings":
@@ -643,7 +644,10 @@ def make_plan(info: MediaInfo, s: Settings, complexity: float | None = None,
     a_hi = math.log2(src_short / short_lo)
     best = None
     for f, filt, clean in fps_cands:
-        b = math.log2(info.fps / f) if f < info.fps else 0.0
+        b = math.log2(info.fps / f) if f < info.fps else 0.0      # octaves of frames saved
+        # perceived loss: halving above 60 fps (120->60) is far less visible than 60->30
+        hi_src, lo_src = max(info.fps, 60.0), min(info.fps, 60.0)
+        b_seen = math.log2(lo_src / min(f, lo_src)) + 0.25 * math.log2(hi_src / max(f, 60.0))
         rem = s0 - FPS_EXP * b
         a = k_res * w_q * rem / (w_res + k_res ** 2 * w_q) if rem > 0 else 0.0
         a = min(max(a, a_lo), a_hi)
@@ -651,7 +655,7 @@ def make_plan(info: MediaInfo, s: Settings, complexity: float | None = None,
         wd, ht = _round_dims(info, short, s.snap_standard)
         a = math.log2(src_short / min(wd, ht))
         short_fall = s0 - FPS_EXP * b - k_res * a
-        loss = w_res * a * a + w_fps * b * b + w_q * max(0.0, short_fall) ** 2
+        loss = w_res * a * a + w_fps * b_seen * b_seen + w_q * max(0.0, short_fall) ** 2
         if s.prefer_clean_fps and not clean:
             loss += 0.35
         if best is None or loss < best[0]:
@@ -688,7 +692,9 @@ def _use_gpu_decode(info: MediaInfo, s: Settings, enc: EncoderSpec) -> bool:
     if s.decoder == "cpu":
         return False
     # auto: CPU decode (all cores) wins for most sources; NVDEC wins on heavy 4K HEVC/AV1.
-    return info.short_side >= 2000 and info.vcodec in ("hevc", "av1", "vp9")
+    # auto: NVDEC for HEVC/AV1/VP9 (heavy to decode on CPU, e.g. OBS HEVC recordings - measured ~5%
+    # faster end-to-end and frees the CPU); CPU for H.264 etc. where all cores are just as fast.
+    return info.vcodec in ("hevc", "av1", "vp9")
 
 
 def _video_filters(info: MediaInfo, plan: Plan, s: Settings, enc: EncoderSpec,
@@ -825,9 +831,25 @@ def _audio_args(info: MediaInfo, plan: Plan, s: Settings) -> tuple[list[str], li
     return maps, ca
 
 
+def apply_turbo(s: Settings) -> Settings:
+    """Turbo mode: fastest presets that still look decent. Measured on a 1440p60 OBS clip at
+    the same bitrate (with OBS using 42% of NVENC): H.264 2.5x -> 4.4x for -2.7 VMAF,
+    AV1 2.3x -> 4.1x for -0.6 VMAF, HEVC -> 4.1x."""
+    if not s.turbo:
+        return s
+    t = Settings.from_dict(s.to_dict())
+    enc = ENCODER_BY_NAME.get(s.encoder, ENCODERS[0])
+    t.speed = min(s.speed, 1 if enc.codec == "av1" and enc.family == "nvenc" else 2)
+    t.temporal_aq = False
+    t.lookahead = 0
+    t.multipass = "disabled"
+    return t
+
+
 def build_commands(info: MediaInfo, plan: Plan, s: Settings, out_path: str,
                    trim=(None, None), video_kbps: float | None = None,
                    gpu_decode: bool | None = None) -> list[list[str]]:
+    s = apply_turbo(s)
     enc = ENCODER_BY_NAME.get(s.encoder, ENCODERS[0])
     if gpu_decode is None:
         gpu_decode = _use_gpu_decode(info, s, enc)
@@ -946,7 +968,10 @@ def run_ffmpeg(cmd: list[str], duration: float, cb: ProgressCb | None, token: Ca
 
 # Rate-control calibration: how much each encoder over/undershoots the requested
 # bitrate. Learned from finished encodes so the first attempt usually lands on target.
-_calib: dict[str, float] = {"hevc_nvenc|vbr": 1.04, "av1_nvenc|vbr": 1.04}
+# Seeds measured on real OBS clips; turbo presets overshoot a bit more.
+_calib: dict[str, float] = {"hevc_nvenc|vbr": 1.04, "av1_nvenc|vbr": 1.04,
+                            "h264_nvenc|vbr|turbo": 1.07, "hevc_nvenc|vbr|turbo": 1.08,
+                            "av1_nvenc|vbr|turbo": 1.08}
 _calib_lock = threading.Lock()
 
 
@@ -965,7 +990,7 @@ def set_calibration(d: dict) -> None:
 
 
 def _calib_key(s: Settings) -> str:
-    return f"{s.encoder}|{s.rate_control}"
+    return f"{s.encoder}|{s.rate_control}" + ("|turbo" if s.turbo else "")
 
 
 def _learn(s: Settings, ratio: float) -> None:
@@ -1035,6 +1060,7 @@ def encode(info: MediaInfo, plan: Plan, s: Settings, out_path: str, trim=(None, 
             shutil.copy2(info.path, out_path)
         return EncodeResult(out_path if plan.action == "copy" else "", info.size, 0, 0.0, 0.0)
 
+    s = apply_turbo(s)
     enc = ENCODER_BY_NAME.get(s.encoder, ENCODERS[0])
     stem, ext = os.path.splitext(out_path)
     tmp_out = f"{stem}.part{ext}"

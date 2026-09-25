@@ -55,9 +55,10 @@ def main():
                    help="0 = cleaner frames (downscale more) ... 100 = more pixels")
     v.add_argument("--no-probe", action="store_true", help="skip the content complexity analysis")
     e = ap.add_argument_group("encoding")
-    e.add_argument("--encoder", default="h264_nvenc", choices=[x.name for x in E.ENCODERS])
+    e.add_argument("--encoder", default="hevc_nvenc", choices=[x.name for x in E.ENCODERS])
     e.add_argument("--speed", type=int, default=5, help="1 fastest ... 7 best")
     e.add_argument("--ten-bit", action="store_true")
+    e.add_argument("--turbo", action="store_true", help="fastest presets, slightly lower quality")
     e.add_argument("--audio", default="first", choices=["first", "mix", "all", "none"])
     e.add_argument("--audio-codec", default="aac", choices=["aac", "opus", "copy"])
     e.add_argument("--audio-bitrate", type=int, default=128)
@@ -74,7 +75,7 @@ def main():
         target_size=a.size, size_unit="MiB" if a.mib else "MB",
         min_height=a.min_height, max_height=a.max_height, min_fps=a.min_fps,
         priority=a.priority, quality_bias=a.quality_bias, smart_probe=not a.no_probe,
-        encoder=a.encoder, speed=a.speed, ten_bit=a.ten_bit,
+        encoder=a.encoder, speed=a.speed, ten_bit=a.ten_bit, turbo=a.turbo,
         audio_mode=a.audio, audio_codec=a.audio_codec, audio_bitrate=a.audio_bitrate,
         output_dir=a.output_dir, name_template=a.name, parallel_jobs=a.jobs)
     if a.percent:

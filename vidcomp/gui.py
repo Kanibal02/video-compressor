@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, QMimeData, Signal
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPalette,
                            QIcon, QPixmap, QPolygon)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
                                QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
@@ -32,6 +32,17 @@ ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets").repl
 ACCENT = "#6d5cff"
 QUALITY_COLORS = {"Excellent": "#4ade80", "Good": "#a3e635", "OK": "#facc15",
                   "Low": "#fb923c", "Very low": "#f87171", "CQ": "#93c5fd"}
+
+CODEC_TIPS = {
+    "h264": ("H.264 - plays everywhere: every browser, phone and Discord client.\n"
+             "Needs the most bits for the same quality."),
+    "hevc": ("H.265 - ~25% smaller than H.264 at the same quality.\n"
+             "Plays on phones, Macs and PCs with a hardware HEVC decoder (most GPUs since ~2016).\n"
+             "Some browsers / very old PCs can't play it."),
+    "av1": ("AV1 - best quality per MB (~40% better than H.264).\n"
+            "Discord desktop and Chrome decode it in software if the GPU can't, so it plays there;\n"
+            "older phones (esp. older iPhones) and some browsers may not play it."),
+}
 
 COL_FILE, COL_SRC, COL_PLAN, COL_TRIM, COL_PROG, COL_RESULT = range(6)
 HEADERS = ["File", "Source", "Output plan", "Trim", "Progress", "Result"]
@@ -243,6 +254,7 @@ class MainWindow(QMainWindow):
         self._reserve_lock = threading.Lock()
 
         self._binding = False
+        self._avail_names: set[str] | None = None
         self._replan_timer = QTimer(self, singleShot=True, interval=120, timeout=self._replan_all)
         self._save_timer = QTimer(self, singleShot=True, interval=800, timeout=self._save_config)
         self._overall_timer = QTimer(self, interval=500, timeout=self._update_overall)
@@ -355,7 +367,35 @@ class MainWindow(QMainWindow):
         self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self.start)
         self.start_btn.setMinimumWidth(150)
+        self.turbo_btn = QPushButton("⚡ Turbo")
+        self.turbo_btn.setObjectName("turbo")
+        self.turbo_btn.setCheckable(True)
+        self.turbo_btn.setToolTip(
+            "Fastest encoder settings, slightly lower quality at the same file size.\n"
+            "Measured on a 1440p60 clip (OBS running):\n"
+            "  H.264: 2.5x → 4.4x realtime, a bit softer in fast motion\n"
+            "  AV1:   2.3x → 4.1x realtime, practically no visible difference\n"
+            "  HEVC:  → 4.1x realtime")
+        self.turbo_btn.toggled.connect(self._turbo_toggled)
+        # quick codec picker - mirrors the Encoder tab's dropdown
+        self.codec_group = QButtonGroup(self)
+        self.codec_group.setExclusive(True)
+        self.codec_btns: dict[str, QPushButton] = {}
+        codec_row = QHBoxLayout()
+        codec_row.setSpacing(0)
+        for i, (codec, text) in enumerate((("h264", "H.264"), ("hevc", "H.265"), ("av1", "AV1"))):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setObjectName("segL" if i == 0 else "segR" if i == 2 else "segM")
+            b.setToolTip(CODEC_TIPS[codec])
+            b.clicked.connect(lambda _=False, c=codec: self._pick_codec(c))
+            self.codec_group.addButton(b)
+            self.codec_btns[codec] = b
+            codec_row.addWidget(b)
         bottom.addSpacing(12)
+        bottom.addLayout(codec_row)
+        bottom.addSpacing(8)
+        bottom.addWidget(self.turbo_btn)
         bottom.addWidget(self.stop_btn)
         bottom.addWidget(self.start_btn)
         outer.addLayout(bottom)
@@ -679,6 +719,7 @@ class MainWindow(QMainWindow):
             else:
                 w.setValue(v)
         self.w_same_dir.setChecked(not s.output_dir)
+        self.turbo_btn.setChecked(s.turbo)
         self.w_sound.setChecked(self.ui_state.get("play_sound", True))
         self.w_open_done.setChecked(self.ui_state.get("open_folder_when_done", False))
         self._binding = False
@@ -725,6 +766,12 @@ class MainWindow(QMainWindow):
 
     def _ui_changed(self, key, v):
         self.ui_state[key] = v
+        self._save_timer.start()
+
+    def _turbo_toggled(self, on: bool):
+        if self._binding:
+            return
+        self.settings.turbo = on
         self._save_timer.start()
 
     def _same_dir_toggled(self, same: bool):
@@ -777,19 +824,33 @@ class MainWindow(QMainWindow):
         self.w_audio_br.setEnabled(s.audio_codec != "copy" or s.audio_mode == "mix")
         self.row_out.setEnabled(bool(s.output_dir) or not self.w_same_dir.isChecked())
         if enc:
-            hints = {
-                "h264": "Plays everywhere, including Discord embeds on every device.",
-                "hevc": "~25% smaller than H.264 at the same quality. Discord desktop/Chrome play it; "
-                        "some older phones/browsers don't.",
-                "av1": "Best quality per MB (~40% better than H.264). Discord desktop, Chrome and "
-                       "newer phones play it.",
-            }
             extra = ("  Runs on the GPU - very fast." if enc.family != "cpu"
                      else "  Runs on the CPU - much slower but slightly more efficient.")
-            self.enc_hint.setText(hints[enc.codec] + extra)
+            self.enc_hint.setText(CODEC_TIPS[enc.codec].replace("\n", " ") + extra)
+            btn = self.codec_btns.get(enc.codec)
+            if btn and not btn.isChecked():
+                btn.setChecked(True)
+
+    def _pick_codec(self, codec: str):
+        """Choose the best available encoder for a codec: GPU (NVENC > QSV > AMF) before CPU,
+        keeping the current family when it supports that codec."""
+        cur = E.ENCODER_BY_NAME.get(self.settings.encoder)
+        avail = self._avail_names or {e.name for e in E.ENCODERS}
+        cands = [e for e in E.ENCODERS if e.codec == codec and e.name in avail]
+        if not cands:
+            return
+        same_family = [e for e in cands if cur and e.family == cur.family]
+        pick = (same_family or cands)[0]
+        self.w_encoder.setCurrentIndex(self.w_encoder.findData(pick.name))
 
     def _on_encoders_ready(self, encs: list):
         names = {e.name for e in encs}
+        self._avail_names = names
+        for codec, btn in self.codec_btns.items():
+            ok = any(e.codec == codec for e in encs)
+            btn.setEnabled(ok)
+            if not ok:
+                btn.setToolTip("No encoder for this codec is available on this PC.")
         model = self.w_encoder.model()
         for i in range(self.w_encoder.count()):
             name = self.w_encoder.itemData(i)
@@ -815,6 +876,13 @@ class MainWindow(QMainWindow):
         self.settings = E.Settings.from_dict(data.get("settings", {}))
         if data.get("version", 1) < 2 and self.settings.speed == 5:
             self.settings.speed = 4  # old default; p5 turned out slower with no quality gain
+        if data.get("version", 1) < 3:  # old defaults that benchmarks showed cost speed for no quality
+            if self.settings.lookahead == 20:
+                self.settings.lookahead = 0
+            if self.settings.multipass == "qres":
+                self.settings.multipass = "disabled"
+        if data.get("version", 1) < 4 and self.settings.encoder == "h264_nvenc":
+            self.settings.encoder = "hevc_nvenc"  # new default
         self.ui_state.update(data.get("ui", {}))
         E.set_calibration(data.get("calibration", {}))
         geo = data.get("ui", {}).get("geometry")
@@ -825,7 +893,7 @@ class MainWindow(QMainWindow):
         g = self.geometry()
         self.ui_state["geometry"] = [g.x(), g.y(), g.width(), g.height()]
         self.ui_state["splitter"] = self.splitter.sizes()
-        data = {"version": 2, "settings": self.settings.to_dict(), "ui": self.ui_state, "calibration": E.calibration()}
+        data = {"version": 4, "settings": self.settings.to_dict(), "ui": self.ui_state, "calibration": E.calibration()}
         try:
             tmp = CONFIG_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -1389,6 +1457,14 @@ QPushButton:disabled {{ color: #5d6070; }}
 QPushButton#primary {{ background: {ACCENT}; border: none; font-weight: 600; padding: 9px 22px; }}
 QPushButton#primary:hover {{ background: #7f70ff; }}
 QPushButton#primary:disabled {{ background: #3b3570; color: #9d98c8; }}
+QPushButton#segL, QPushButton#segM, QPushButton#segR {{ padding: 9px 12px; border-radius: 0; }}
+QPushButton#segL {{ border-top-left-radius: 7px; border-bottom-left-radius: 7px; }}
+QPushButton#segR {{ border-top-right-radius: 7px; border-bottom-right-radius: 7px; }}
+QPushButton#segM {{ border-left: none; border-right: none; }}
+QPushButton#segL:checked, QPushButton#segM:checked, QPushButton#segR:checked {{
+    background: #2d2a55; border-color: {ACCENT}; color: #ffffff; font-weight: 600; }}
+QPushButton#turbo {{ padding: 9px 16px; }}
+QPushButton#turbo:checked {{ background: #3a3217; border: 1px solid #facc15; color: #facc15; font-weight: 600; }}
 QPushButton#chip {{ padding: 4px 8px; border-radius: 12px; min-width: 30px; }}
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{ background: #22232c; border: 1px solid #30323f;
     border-radius: 6px; padding: 5px 8px; min-height: 20px; selection-background-color: {ACCENT}; }}
